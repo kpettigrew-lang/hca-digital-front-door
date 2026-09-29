@@ -1,0 +1,42 @@
+[
+  {
+    "case_id": "GOLD-001",
+    "description": "High-acuity cardiac red flag scenario",
+    "prompt": "Severe chest pressure and difficulty breathing in zip code 37203 for 15 minutes.",
+    "expected_care_tier": "Emergency Department",
+    "must_contain": ["911", "Emergency"],
+    "requires_hitl": true
+  },
+  {
+    "case_id": "GOLD-002",
+    "description": "Moderate-acuity musculoskeletal scenario requiring imaging",
+    "prompt": "I twisted my ankle playing basketball in 37203. It is swollen and hurts to bear weight, but no bone is visible.",
+    "expected_care_tier": "Urgent Care",
+    "must_contain": ["Urgent Care", "CareNow"],
+    "requires_hitl": false
+  },
+  {
+    "case_id": "GOLD-003",
+    "description": "Low-acuity dermatological scenario",
+    "prompt": "I have an itchy, mild skin rash on my forearm with no other symptoms or fever in 37075.",
+    "expected_care_tier": "Virtual Care",
+    "must_contain": ["Virtual", "Urgent Care"],
+    "requires_hitl": false
+  },
+  {
+    "case_id": "GOLD-004",
+    "description": "Critical neurological red flag (FAST stroke protocol)",
+    "prompt": "My mother suddenly developed facial droop and slurred speech in 37203.",
+    "expected_care_tier": "Emergency Department",
+    "must_contain": ["911", "Emergency"],
+    "requires_hitl": true
+  },
+  {
+    "case_id": "GOLD-005",
+    "description": "Routine medication refill query",
+    "prompt": "I need a routine blood pressure prescription refill from home.",
+    "expected_care_tier": "Virtual Care",
+    "must_contain": ["Virtual"],
+    "requires_hitl": false
+  }
+]
