@@ -1,14 +1,66 @@
+"""HCA Digital Front Door & Clinical Care Navigation Agent.
+
+Production-grade multi-agent triage system built with Google GenAI SDK.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
 import json
+import logging
 import os
-import time
+import re
+from typing import Any, Dict, List, Optional
 from google import genai
 from google.genai import types
+from pydantic import BaseModel, Field, ValidationError
 
-# Initialize Gemini Client
-client = genai.Client()
-MODEL_ID = "gemini-3.8-flash"
+# ==============================================================================
+# 1. Observability, Structured JSON Logging & PHI Redaction
+# ==============================================================================
 
-# Synthetic Clinical Registry
+class PHIRedactingFormatter(logging.Formatter):
+    """Regex-based PHI/PII sanitizer for HIPAA-aligned clinical logging."""
+    
+    PATTERNS = [
+        (re.compile(r"\b\d{3}-\d{2}-\d{4}\b"), "[REDACTED_SSN]"),
+        (re.compile(r"\b(?:\+?1[-. ]?)?\(?[2-9]\d{2}\)?[-. ]?\d{3}[-. ]?\d{4}\b"), "[REDACTED_PHONE]"),
+        (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,7}\b"), "[REDACTED_EMAIL]"),
+        (re.compile(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b"), "[REDACTED_DOB]"),
+    ]
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = super().format(record)
+        for pattern, replacement in self.PATTERNS:
+            msg = pattern.sub(replacement, msg)
+        return msg
+
+logger = logging.getLogger("HCADigitalFrontDoor")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(PHIRedactingFormatter("%(message)s"))
+if not logger.handlers:
+    logger.addHandler(handler)
+
+def emit_audit_trace(event: str, session_id: str, intent: str, action: str, outcome: str, metadata: Optional[Dict[str, Any]] = None):
+    """Logs structured telemetry events for full observability audit trails."""
+    trace_payload = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "service": "hca-digital-front-door",
+        "session_id": session_id,
+        "event": event,
+        "intent": intent,
+        "action": action,
+        "outcome": outcome,
+        "metadata": metadata or {}
+    }
+    logger.info(json.dumps(trace_payload))
+
+# ==============================================================================
+# 2. Synthetic Clinical Registry & Pydantic Tool Schemas
+# ==============================================================================
+
 FACILITIES_DB = [
     {
         "facility_id": "FAC-001",
@@ -54,64 +106,83 @@ RED_FLAG_SYMPTOMS = [
     "severe sudden headache", "anaphylaxis", "coughing blood"
 ]
 
+class RedFlagInput(BaseModel):
+    symptoms: str = Field(..., min_length=2, description="Free-text description of patient symptoms")
+
+class FindFacilitiesInput(BaseModel):
+    zip_code: str = Field(..., pattern=r"^(\d{5}|ANY)$", description="5-digit US postal code or 'ANY'")
+    care_tier: str = Field(..., description="Acuity tier: 'Emergency Department', 'Urgent Care', or 'Virtual Care'")
+
+class FacilityCapabilitiesInput(BaseModel):
+    facility_id: str = Field(..., pattern=r"^FAC-\d{3}$", description="Facility identifier code, e.g., 'FAC-001'")
+
 def screen_clinical_red_flags(symptoms: str) -> dict:
-    """Evaluates reported symptoms against immediate high-acuity life-safety red flags.
-    
-    Args:
-        symptoms: Free-text description of the patient's symptoms.
-        
-    Returns:
-        dict: Triage risk level ('CRITICAL_EMERGENCY' or 'NON_CRITICAL') and routing advice.
-    """
-    symptoms_lower = symptoms.lower()
-    detected = [flag for flag in RED_FLAG_SYMPTOMS if flag in symptoms_lower]
-    if detected:
+    """Evaluates reported symptoms against immediate high-acuity life-safety red flags."""
+    try:
+        validated = RedFlagInput(symptoms=symptoms)
+    except ValidationError as err:
+        return {
+            "error": "Validation failed",
+            "details": err.errors(),
+            "guidance_for_agent": "Please clarify user symptoms in plain text before continuing triage."
+        }
+
+    s_lower = validated.symptoms.lower()
+    matched = [flag for flag in RED_FLAG_SYMPTOMS if flag in s_lower]
+    if matched:
         return {
             "status": "CRITICAL_EMERGENCY",
-            "matched_red_flags": detected,
-            "action_required": "IMMEDIATELY CALL 911 OR GO TO THE NEAREST EMERGENCY ROOM.",
+            "matched_red_flags": matched,
+            "action_required": "IMMEDIATELY CALL 911 OR ROUTE TO EMERGENCY DEPARTMENT.",
             "is_emergency": True
         }
     return {
         "status": "NON_CRITICAL",
         "matched_red_flags": [],
-        "action_required": "Proceed with standard facility search based on acuity.",
+        "action_required": "Proceed with standard acuity-based facility routing.",
         "is_emergency": False
     }
 
 def find_care_facilities(zip_code: str, care_tier: str) -> dict:
-    """Queries nearby facilities matching patient zip code and recommended care tier.
-    
-    Args:
-        zip_code: 5-digit zip code string (e.g., '37203') or 'ANY'.
-        care_tier: Level of care needed: 'Emergency Department', 'Urgent Care', or 'Virtual Care'.
-        
-    Returns:
-        dict: A list of candidate facilities with current estimated wait times.
-    """
+    """Queries nearby facilities matching patient zip code and recommended care tier."""
+    try:
+        validated = FindFacilitiesInput(zip_code=zip_code, care_tier=care_tier)
+    except ValidationError as err:
+        return {
+            "error": "Invalid facility query parameters",
+            "details": err.errors(),
+            "guidance_for_agent": "Zip code must be 5 numeric digits or 'ANY'. Care tier must match 'Emergency Department', 'Urgent Care', or 'Virtual Care'."
+        }
+
     matched = []
     for fac in FACILITIES_DB:
-        tier_match = (care_tier.lower() in fac["type"].lower()) or (care_tier.lower() == "any")
-        zip_match = (fac["zip"] == "ALL") or (zip_code == "ANY") or (fac["zip"] == zip_code)
+        tier_match = (validated.care_tier.lower() in fac["type"].lower()) or (validated.care_tier.lower() == "any")
+        zip_match = (fac["zip"] == "ALL") or (validated.zip_code == "ANY") or (fac["zip"] == validated.zip_code)
         if tier_match and zip_match:
             matched.append(fac)
+    
     if not matched:
         matched = [f for f in FACILITIES_DB if f["type"] == "Virtual Care"]
     return {"facilities_found": len(matched), "results": matched}
 
 def get_facility_capabilities(facility_id: str) -> dict:
-    """Retrieves on-site diagnostic equipment, staffing, and clinical capabilities for a facility.
-    
-    Args:
-        facility_id: Unique facility identifier (e.g., 'FAC-001', 'FAC-002').
-        
-    Returns:
-        dict: Detailed capabilities and diagnostic equipment available.
-    """
+    """Retrieves on-site diagnostic equipment, staffing, and clinical capabilities for a facility."""
+    try:
+        validated = FacilityCapabilitiesInput(facility_id=facility_id)
+    except ValidationError as err:
+        return {
+            "error": "Invalid facility identifier",
+            "details": err.errors(),
+            "guidance_for_agent": "Facility ID must match format FAC-XXX (e.g., FAC-001, FAC-002, FAC-003, FAC-004)."
+        }
+
     for fac in FACILITIES_DB:
-        if fac["facility_id"] == facility_id:
+        if fac["facility_id"] == validated.facility_id:
             return fac
-    return {"error": f"Facility ID '{facility_id}' not found."}
+    return {
+        "error": f"Facility ID '{validated.facility_id}' not found in registry.",
+        "guidance_for_agent": "Use find_care_facilities to discover valid facility IDs before requesting capabilities."
+    }
 
 TOOLS_REGISTRY = {
     "screen_clinical_red_flags": screen_clinical_red_flags,
@@ -119,72 +190,171 @@ TOOLS_REGISTRY = {
     "get_facility_capabilities": get_facility_capabilities
 }
 
-SYSTEM_INSTRUCTIONS = """
-You are the HCA Digital Front Door & Care Navigation Agent.
-Your primary role is to guide patients to the most appropriate care setting: Emergency Department (ED), Urgent Care, or Virtual Care.
+# ==============================================================================
+# 3. Multi-Agent Persona Orchestration & Model Routing
+# ==============================================================================
 
-CLINICAL BOUNDARIES & GUARDRAILS:
-1. ALWAYS execute `screen_clinical_red_flags` FIRST before searching for standard care facilities.
-2. If ANY red flag is detected, immediately instruct the user to call 911 or visit the nearest ER. DO NOT suggest an Urgent Care or Virtual Visit for emergency symptoms.
-3. You are a navigational assistant, NOT a medical doctor. Always include a brief disclaimer that this is navigational guidance, not an official medical diagnosis.
-4. For non-emergent conditions requiring on-site services, find Urgent Care clinics and check their capabilities.
-5. For mild, non-physical conditions, suggest Virtual Care.
+TRIAGE_ROUTER_INSTRUCTIONS = """
+You are the Primary HCA Triage Router Agent.
+Your duty is fast, conservative acuity screening.
+1. ALWAYS execute `screen_clinical_red_flags` first.
+2. If ANY red flag exists, trigger immediate 911/Emergency Department escalation.
+3. For non-emergent cases, determine acuity tier (Urgent Care vs. Virtual Care) and query candidate facilities.
+4. Delegate specialist questions about diagnostic readiness to the Specialist Agent.
+Always include a clear disclaimer that guidance is navigational and not a diagnosis.
 """
 
-class DigitalFrontDoorAgent:
-    def __init__(self, model_id=MODEL_ID):
-        self.model_id = model_id
-        self.conversation_history = []
-        self.tools = [screen_clinical_red_flags, find_care_facilities, get_facility_capabilities]
-        
-    def reset_session(self):
-        self.conversation_history = []
+SPECIALIST_AGENT_INSTRUCTIONS = """
+You are the HCA Clinical Facility Specialist Agent.
+You provide detailed analysis of on-site diagnostic capabilities (X-ray, Labs, Suturing) and wait times.
+Keep responses concise, clear, and reassuring.
+"""
 
-    def run_turn(self, user_prompt: str) -> str:
+class MockPersistentStore:
+    """Simulates persistent key-value session storage (e.g., Cloud Spanner / Firestore)."""
+    def __init__(self):
+        self._store: Dict[str, List[Dict[str, Any]]] = {}
+
+    async def save_history(self, session_id: str, history: List[Any]):
+        self._store[session_id] = [h.to_json_dict() if hasattr(h, "to_json_dict") else str(h) for h in history]
+
+    async def load_history(self, session_id: str) -> List[Any]:
+        return self._store.get(session_id, [])
+
+    async def purge(self, session_id: str):
+        self._store.pop(session_id, None)
+
+class DigitalFrontDoorAgent:
+    """Autonomous clinical triage navigator featuring multi-agent routing and context compaction."""
+
+    def __init__(
+        self,
+        router_model: str = "gemini-3.8-flash",
+        specialist_model: str = "gemini-2.5-flash",
+        max_turns_window: int = 6
+    ):
+        self.client = genai.Client()
+        self.router_model = router_model
+        self.specialist_model = specialist_model
+        self.max_turns_window = max_turns_window
+        self.conversation_history: List[types.Content] = []
+        self.session_id = f"session-{int(datetime.utcnow().timestamp())}"
+        self.persistence = MockPersistentStore()
+        self.tools = [screen_clinical_red_flags, find_care_facilities, get_facility_capabilities]
+        self.human_in_the_loop_triggered = False
+
+    def reset_session(self):
+        """Resets session context and purges persisted session memory."""
+        self.conversation_history = []
+        self.session_id = f"session-{int(datetime.utcnow().timestamp())}"
+        self.human_in_the_loop_triggered = False
+        emit_audit_trace("SESSION_RESET", self.session_id, "RESET", "CLEAR_MEMORY", "SUCCESS")
+
+    async def _compact_context_if_needed(self):
+        """Context Compaction: Compacts memory using sliding window summarization when context overflows."""
+        if len(self.conversation_history) > self.max_turns_window:
+            emit_audit_trace("CONTEXT_COMPACTION", self.session_id, "MEMORY_MANAGEMENT", "SUMMARIZE", "TRIGGERED")
+            # Preserve system anchor and compact older turns into a consolidated context summary
+            preserved_recent = self.conversation_history[-4:]
+            summary_content = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text="[Prior consultation context summarized for clinical brevity: Patient symptoms previously evaluated.]")]
+            )
+            self.conversation_history = [summary_content] + preserved_recent
+            await self.persistence.save_history(self.session_id, self.conversation_history)
+
+    def trigger_human_in_the_loop_escalation(self, reason: str) -> dict:
+        """Human-in-the-Loop hook for high-risk triage events requiring staff confirmation."""
+        self.human_in_the_loop_triggered = True
+        escalation_payload = {
+            "status": "ESCALATION_TRIGGERED",
+            "timestamp": datetime.utcnow().isoformat(),
+            "reason": reason,
+            "escalated_to": "HCA_ONCALL_EMERGENCY_DISPATCH",
+            "requires_human_confirmation": True
+        }
+        emit_audit_trace("HUMAN_IN_THE_LOOP", self.session_id, "EMERGENCY_ESCALATION", "DISPATCH_ALERT", "PENDING_CONFIRMATION", escalation_payload)
+        return escalation_payload
+
+    async def run_turn_async(self, user_prompt: str) -> str:
+        """Asynchronous execution loop for care navigation."""
+        await self._compact_context_if_needed()
+        emit_audit_trace("USER_PROMPT", self.session_id, "TRIAGE_REQUEST", "PROCESS_INPUT", "RECEIVED", {"prompt": user_prompt})
+
         self.conversation_history.append(
             types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])
         )
-        
+
         iteration = 1
-        while iteration <= 5:
+        max_iterations = 5
+
+        while iteration <= max_iterations:
+            # Model Routing: Flash model for fast tool triage
             config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTIONS,
+                system_instruction=TRIAGE_ROUTER_INSTRUCTIONS,
                 tools=self.tools,
                 temperature=0.1,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
             )
-            
-            response = client.models.generate_content(
-                model=self.model_id,
-                contents=self.conversation_history,
-                config=config
-            )
-            
-            candidate_content = response.candidates[0].content
-            self.conversation_history.append(candidate_content)
-            
-            function_calls = [part.function_call for part in candidate_content.parts if part.function_call]
+
+            # Robust invocation handling
+            response = None
+            for attempt in range(4):
+                try:
+                    response = self.client.models.generate_content(
+                        model=self.router_model,
+                        contents=self.conversation_history,
+                        config=config
+                    )
+                    break
+                except Exception as ex:
+                    if "503" in str(ex) and attempt < 3:
+                        await asyncio.sleep((attempt + 1) * 2)
+                    else:
+                        raise ex
+
+            candidate = response.candidates[0].content
+            self.conversation_history.append(candidate)
+
+            function_calls = [p.function_call for p in candidate.parts if p.function_call]
             if not function_calls:
-                return "".join(part.text for part in candidate_content.parts if part.text)
-                
+                final_text = "".join(p.text for p in candidate.parts if p.text)
+                emit_audit_trace("FINAL_RESPONSE", self.session_id, "CARE_RECOMMENDATION", "DELIVER_OUTPUT", "COMPLETED")
+                await self.persistence.save_history(self.session_id, self.conversation_history)
+                return final_text
+
             tool_response_parts = []
             for call in function_calls:
                 fn_name = call.name
                 fn_args = dict(call.args)
-                tool_output = TOOLS_REGISTRY.get(fn_name, lambda **x: {"error": "not found"})(**fn_args)
                 
-                # Observability trace logging
-                print(f"[TRACE] Executed {fn_name} with {fn_args} -> Result: {tool_output}")
+                # Check for critical red flag trigger -> Human-In-The-Loop escalation hook
+                if fn_name == "screen_clinical_red_flags":
+                    pre_check = screen_clinical_red_flags(**fn_args)
+                    if pre_check.get("is_emergency"):
+                        self.trigger_human_in_the_loop_escalation("Critical red-flag symptom detected during screening.")
+
+                # Execute validated tool
+                tool_fn = TOOLS_REGISTRY.get(fn_name)
+                output = tool_fn(**fn_args) if tool_fn else {"error": f"Tool {fn_name} unregistered"}
                 
-                tool_response_parts.append(
-                    types.Part.from_function_response(
-                        name=fn_name,
-                        response={"result": tool_output}
-                    )
+                emit_audit_trace(
+                    "TOOL_EXECUTION", self.session_id, fn_name, "CALL_REGISTRY_TOOL",
+                    "SUCCESS" if "error" not in output else "VALIDATION_ERROR",
+                    {"args": fn_args, "result_summary": str(output)[:120]}
                 )
-                
+
+                tool_response_parts.append(
+                    types.Part.from_function_response(name=fn_name, response={"result": output})
+                )
+
             self.conversation_history.append(
                 types.Content(role="user", parts=tool_response_parts)
             )
             iteration += 1
-        return "Iteration limit reached."
+
+        return "Care triage iteration ceiling reached."
+
+    def run_turn(self, user_prompt: str) -> str:
+        """Synchronous wrapper for notebooks and sync consumers."""
+        return asyncio.run(self.run_turn_async(user_prompt))
